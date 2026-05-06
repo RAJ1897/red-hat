@@ -1,0 +1,138 @@
+//@version=6
+indicator("Umar's Key Level (Gold)", "Key Level", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+// ════════════════════════════════════════════════════════════
+// INPUTS
+// ════════════════════════════════════════════════════════════
+grpSession = "Session Settings (Dubai Time)"
+sessionStr = input.session("0400-1600", "Calculation Window", group = grpSession, tooltip = "Internal calculation window")
+tz         = input.string("Asia/Dubai", "Timezone", options = ["Asia/Dubai"], group = grpSession)
+
+grpCalc    = "Calculation"
+calcTF     = input.timeframe("15", "Calculation Timeframe", group = grpCalc)
+rowCount   = input.int(24, "Row Count", minval = 5, maxval = 200, group = grpCalc)
+useTickVol = input.bool(true, "Use Tick Volume if real volume unavailable", group = grpCalc)
+
+grpStyle      = "Display"
+levelColor    = input.color(color.white, "Key Level Line Color", group = grpStyle)
+labelColor    = input.color(color.new(color.gray, 0), "Key Level Label Background", group = grpStyle)
+labelTextColor= input.color(color.white, "Key Level Label Text Color", group = grpStyle)
+levelWidth    = input.int(2, "Key Level Width", minval = 1, maxval = 5, group = grpStyle)
+levelStyle    = input.string("Solid", "Key Level Style", options = ["Solid", "Dashed", "Dotted"], group = grpStyle)
+labelOffset   = input.int(20, "Label Offset (bars to the right)", minval = 5, maxval = 100, group = grpStyle)
+
+// ════════════════════════════════════════════════════════════
+// SESSION DETECTION (Dubai time)
+// ════════════════════════════════════════════════════════════
+inSession    = not na(time(timeframe.period, sessionStr, tz))
+sessionStart = inSession and not inSession[1]
+sessionEnd   = not inSession and inSession[1]
+
+// ════════════════════════════════════════════════════════════
+// COLLECT 15-MIN OHLCV WITHIN SESSION
+// ════════════════════════════════════════════════════════════
+[htfHigh, htfLow, htfClose, htfVol] = request.security(syminfo.tickerid, calcTF, [high, low, close, volume], lookahead = barmerge.lookahead_off)
+
+sampleVol = useTickVol and (na(htfVol) or htfVol == 0) ? 1.0 : nz(htfVol, 0.0)
+
+var array<float> arrHigh = array.new<float>()
+var array<float> arrLow  = array.new<float>()
+var array<float> arrVol  = array.new<float>()
+
+var float sessHigh = na
+var float sessLow  = na
+
+var array<line>  keyLines  = array.new<line>()
+var array<label> keyLabels = array.new<label>()
+
+// ------ Reset arrays at session start ------
+if sessionStart
+    array.clear(arrHigh)
+    array.clear(arrLow)
+    array.clear(arrVol)
+    sessHigh := high
+    sessLow  := low
+
+// ------ Sample bars while inside session ------
+htfBarChange = ta.change(time(calcTF)) != 0
+
+if inSession and htfBarChange
+    array.push(arrHigh, htfHigh)
+    array.push(arrLow,  htfLow)
+    array.push(arrVol,  sampleVol)
+    sessHigh := na(sessHigh) ? htfHigh : math.max(sessHigh, htfHigh)
+    sessLow  := na(sessLow)  ? htfLow  : math.min(sessLow,  htfLow)
+
+if inSession
+    sessHigh := na(sessHigh) ? high : math.max(sessHigh, high)
+    sessLow  := na(sessLow)  ? low  : math.min(sessLow,  low)
+
+// ════════════════════════════════════════════════════════════
+// BUILD VOLUME PROFILE & FIND POC
+// ════════════════════════════════════════════════════════════
+calcPOC() =>
+    float poc = na
+    float maxVol = 0.0
+    array<float> bins = array.new<float>(rowCount, 0.0)
+
+    if array.size(arrHigh) > 0 and not na(sessHigh) and not na(sessLow) and sessHigh > sessLow
+        float binSize = (sessHigh - sessLow) / rowCount
+
+        for i = 0 to array.size(arrHigh) - 1
+            float h = array.get(arrHigh, i)
+            float l = array.get(arrLow,  i)
+            float v = array.get(arrVol,  i)
+
+            int startBin = int(math.floor((l - sessLow) / binSize))
+            int endBin   = int(math.floor((h - sessLow) / binSize))
+            startBin := math.max(0, math.min(rowCount - 1, startBin))
+            endBin   := math.max(0, math.min(rowCount - 1, endBin))
+
+            int spanned = endBin - startBin + 1
+            float volPerBin = v / spanned
+
+            for b = startBin to endBin
+                array.set(bins, b, array.get(bins, b) + volPerBin)
+
+        int pocBin = 0
+        for b = 0 to rowCount - 1
+            float bv = array.get(bins, b)
+            if bv > maxVol
+                maxVol := bv
+                pocBin := b
+
+        poc := sessLow + (pocBin + 0.5) * binSize
+
+    poc
+
+// ════════════════════════════════════════════════════════════
+// DRAW AT SESSION END (16:00 DUBAI)
+// ════════════════════════════════════════════════════════════
+if sessionEnd
+    pocPrice = calcPOC()
+
+    if not na(pocPrice)
+        while array.size(keyLines) > 0
+            line.delete(array.shift(keyLines))
+        while array.size(keyLabels) > 0
+            label.delete(array.shift(keyLabels))
+
+        ls = levelStyle == "Dashed" ? line.style_dashed : levelStyle == "Dotted" ? line.style_dotted : line.style_solid
+
+        line keyLn = line.new(bar_index, pocPrice, bar_index + 1, pocPrice, color = levelColor, width = levelWidth, style = ls, extend = extend.right)
+        array.push(keyLines, keyLn)
+
+// ════════════════════════════════════════════════════════════
+// KEEP "KEY LEVEL" LABEL ANCHORED TO RIGHT EDGE EVERY BAR
+// ════════════════════════════════════════════════════════════
+if barstate.islast and array.size(keyLines) > 0
+    currentLn = array.get(keyLines, array.size(keyLines) - 1)
+    float currentPrice = line.get_y1(currentLn)
+
+    while array.size(keyLabels) > 0
+        label.delete(array.shift(keyLabels))
+
+    label lbl = label.new(bar_index + labelOffset, currentPrice, "Key Level", style = label.style_label_left, color = labelColor, textcolor = labelTextColor)
+    array.push(keyLabels, lbl)
+
+plot(na, "Key Level", display = display.none)
